@@ -4,6 +4,8 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
+from pyproj import Transformer
+from scipy.spatial import cKDTree
 from shapely import MultiPolygon, Polygon
 from tqdm.auto import tqdm
 from tqdm.contrib.concurrent import process_map
@@ -13,6 +15,7 @@ from iduedu.constants.transport_specs import DEFAULT_REGISTRY, TransportRegistry
 from iduedu.modules.graph_transformers import clip_nx_graph, estimate_crs_for_bounds
 from iduedu.modules.overpass.overpass_downloaders import (
     get_4326_boundary,
+    get_points_by_tags,
     get_routes_by_poly,
 )
 from iduedu.modules.overpass.overpass_parsers import (
@@ -154,6 +157,133 @@ def _multi_ground_to_edgenode(args):
     return overpass_ground_transport2edgenode(*args)
 
 
+def _inject_extra_tagged_platforms(
+    graph: nx.DiGraph,
+    polygon: Polygon,
+    local_crs: int,
+    extra_stop_tags: dict[str, list[dict[str, str]]] | None,
+    extra_stop_match_radius_m: float,
+    extra_stop_attach_radius_m: float,
+) -> tuple[nx.DiGraph, dict]:
+    if not extra_stop_tags:
+        return graph, {"downloaded_candidates": 0, "added_platforms": 0, "skipped_near_existing": 0, "skipped_no_attach": 0}
+
+    transformer = Transformer.from_crs("EPSG:4326", local_crs, always_xy=True)
+    graph_out = graph.copy()
+    total_candidates = 0
+    total_added = 0
+    total_skipped_near = 0
+    total_skipped_attach = 0
+
+    platform_nodes = [
+        (node_id, data)
+        for node_id, data in graph_out.nodes(data=True)
+        if data.get("type") in {"platform", "subway_platform", "subway_entry_exit", "subway_entry", "subway_exit"}
+    ]
+    platform_coords = np.array([(float(data["x"]), float(data["y"])) for _, data in platform_nodes], dtype=float)
+    platform_tree = cKDTree(platform_coords) if len(platform_coords) else None
+
+    next_node_id = (max(graph_out.nodes) + 1) if graph_out.number_of_nodes() else 0
+
+    for transport_type, tag_queries in extra_stop_tags.items():
+        if not tag_queries:
+            continue
+
+        tagged_df = get_points_by_tags(polygon, tag_queries)
+        if tagged_df.empty:
+            continue
+
+        candidate_records = []
+        for _, row in tagged_df.iterrows():
+            lon = row.get("lon")
+            lat = row.get("lat")
+            center = row.get("center")
+            if (lon is None or lat is None) and isinstance(center, dict):
+                lon = center.get("lon")
+                lat = center.get("lat")
+            if lon is None or lat is None:
+                continue
+            x, y = transformer.transform(float(lon), float(lat))
+            candidate_records.append(
+                {
+                    "osm_ref": f"{row.get('type', 'element')}:{row.get('id')}",
+                    "x": float(x),
+                    "y": float(y),
+                    "tags": row.get("tags", {}) if isinstance(row.get("tags"), dict) else {},
+                }
+            )
+
+        if not candidate_records:
+            continue
+
+        total_candidates += len(candidate_records)
+
+        stop_nodes = [
+            (node_id, data)
+            for node_id, data in graph_out.nodes(data=True)
+            if data.get("type") == transport_type
+        ]
+        if not stop_nodes:
+            total_skipped_attach += len(candidate_records)
+            continue
+
+        stop_coords = np.array([(float(data["x"]), float(data["y"])) for _, data in stop_nodes], dtype=float)
+        stop_tree = cKDTree(stop_coords)
+
+        for candidate in candidate_records:
+            point_xy = np.array([candidate["x"], candidate["y"]], dtype=float)
+
+            if platform_tree is not None:
+                dist_platform, _ = platform_tree.query(point_xy, k=1)
+                if float(dist_platform) <= float(extra_stop_match_radius_m):
+                    total_skipped_near += 1
+                    continue
+
+            dist_stop, stop_idx = stop_tree.query(point_xy, k=1)
+            if float(dist_stop) <= float(extra_stop_match_radius_m):
+                total_skipped_near += 1
+                continue
+            if float(dist_stop) > float(extra_stop_attach_radius_m):
+                total_skipped_attach += 1
+                continue
+
+            nearest_stop_id, nearest_stop_data = stop_nodes[int(stop_idx)]
+            tags = candidate["tags"]
+            route_value = nearest_stop_data.get("route")
+            graph_out.add_node(
+                next_node_id,
+                x=round(candidate["x"], 5),
+                y=round(candidate["y"], 5),
+                type="platform",
+                route=route_value,
+                source="osm_extra_stop_tag",
+                stop_transport_type=transport_type,
+                osm_ref=candidate["osm_ref"],
+                name=tags.get("name"),
+                ref=tags.get("ref"),
+            )
+            graph_out.add_edge(next_node_id, nearest_stop_id, type="boarding", route=route_value, length_meter=0.0, time_min=0.0)
+            graph_out.add_edge(nearest_stop_id, next_node_id, type="boarding", route=route_value, length_meter=0.0, time_min=0.0)
+
+            if platform_tree is None:
+                platform_coords = np.array([[candidate["x"], candidate["y"]]], dtype=float)
+                platform_tree = cKDTree(platform_coords)
+            else:
+                platform_coords = np.vstack([platform_coords, [candidate["x"], candidate["y"]]])
+                platform_tree = cKDTree(platform_coords)
+
+            total_added += 1
+            next_node_id += 1
+
+    stats = {
+        "downloaded_candidates": int(total_candidates),
+        "added_platforms": int(total_added),
+        "skipped_near_existing": int(total_skipped_near),
+        "skipped_no_attach": int(total_skipped_attach),
+    }
+    return graph_out, stats
+
+
 def _build_public_transport_graph(
     osm_id: int | None,
     territory: Polygon | MultiPolygon | gpd.GeoDataFrame | None,
@@ -162,6 +292,9 @@ def _build_public_transport_graph(
     transport_registry: TransportRegistry,
     clip_by_territory: bool = False,
     keep_edge_geometry: bool = True,
+    extra_stop_tags: dict[str, list[dict[str, str]]] | None = None,
+    extra_stop_match_radius_m: float = 20.0,
+    extra_stop_attach_radius_m: float = 80.0,
 ):
     """
     Build a directed public-transport graph for one or multiple OSM public-transport modes inside a territory.
@@ -285,6 +418,15 @@ def _build_public_transport_graph(
     )
     nx_graph.graph["crs"] = local_crs
     nx_graph.graph["type"] = "public_transport"
+    nx_graph, extra_stop_stats = _inject_extra_tagged_platforms(
+        nx_graph,
+        polygon,
+        local_crs,
+        extra_stop_tags=extra_stop_tags,
+        extra_stop_match_radius_m=extra_stop_match_radius_m,
+        extra_stop_attach_radius_m=extra_stop_attach_radius_m,
+    )
+    nx_graph.graph["extra_stop_stats"] = extra_stop_stats
 
     if clip_by_territory:
         poly_proj = gpd.GeoSeries([polygon], crs=4326).to_crs(local_crs).union_all()
@@ -304,6 +446,9 @@ def get_public_transport_graph(
     keep_edge_geometry: bool = True,
     osm_edge_tags: list[str] | None = None,
     transport_registry: TransportRegistry | None = None,
+    extra_stop_tags: dict[str, list[dict[str, str]]] | None = None,
+    extra_stop_match_radius_m: float = 20.0,
+    extra_stop_attach_radius_m: float = 80.0,
 ) -> nx.Graph:
     """
     Build a directed public-transport graph for one or multiple transport modes within a territory.
@@ -368,6 +513,9 @@ def get_public_transport_graph(
         transport_registry=registry,
         clip_by_territory=clip_by_territory,
         keep_edge_geometry=keep_edge_geometry,
+        extra_stop_tags=extra_stop_tags,
+        extra_stop_match_radius_m=extra_stop_match_radius_m,
+        extra_stop_attach_radius_m=extra_stop_attach_radius_m,
     )
 
 
@@ -380,6 +528,9 @@ def get_single_public_transport_graph(
     keep_edge_geometry: bool = True,
     osm_edge_tags: list[str] | None = None,
     transport_registry: TransportRegistry | None = None,
+    extra_stop_tags: dict[str, list[dict[str, str]]] | None = None,
+    extra_stop_match_radius_m: float = 20.0,
+    extra_stop_attach_radius_m: float = 80.0,
 ) -> nx.Graph:  # pragma: no cover
     """
     Deprecated wrapper for ``get_public_transport_graph``.
@@ -401,6 +552,9 @@ def get_single_public_transport_graph(
         keep_edge_geometry=keep_edge_geometry,
         osm_edge_tags=osm_edge_tags,
         transport_registry=transport_registry,
+        extra_stop_tags=extra_stop_tags,
+        extra_stop_match_radius_m=extra_stop_match_radius_m,
+        extra_stop_attach_radius_m=extra_stop_attach_radius_m,
     )
 
 
@@ -413,6 +567,9 @@ def get_all_public_transport_graph(
     transport_types: list[str] | None = None,
     osm_edge_tags: list[str] | None = None,
     transport_registry: TransportRegistry | None = None,
+    extra_stop_tags: dict[str, list[dict[str, str]]] | None = None,
+    extra_stop_match_radius_m: float = 20.0,
+    extra_stop_attach_radius_m: float = 80.0,
 ) -> nx.Graph:  # pragma: no cover
     """
     Deprecated wrapper for ``get_public_transport_graph``.
@@ -434,4 +591,7 @@ def get_all_public_transport_graph(
         keep_edge_geometry=keep_edge_geometry,
         osm_edge_tags=osm_edge_tags,
         transport_registry=transport_registry,
+        extra_stop_tags=extra_stop_tags,
+        extra_stop_match_radius_m=extra_stop_match_radius_m,
+        extra_stop_attach_radius_m=extra_stop_attach_radius_m,
     )

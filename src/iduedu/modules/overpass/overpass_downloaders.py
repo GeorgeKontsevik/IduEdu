@@ -415,6 +415,52 @@ def get_network_by_filters(polygon: Polygon, way_filter: str) -> pd.DataFrame:
     return pd.DataFrame(json_result)
 
 
+def _tag_dict_to_filter(tag_dict: dict[str, str]) -> str:
+    parts = []
+    for key, value in tag_dict.items():
+        parts.append(f'["{key}"="{value}"]')
+    return "".join(parts)
+
+
+def get_points_by_tags(polygon: Polygon, tag_queries: list[dict[str, str]]) -> pd.DataFrame:
+    if not tag_queries:
+        return pd.DataFrame()
+
+    polygon_coords = _poly_to_overpass(polygon)
+    header = config.overpass_header
+    query_parts = [header, "("]
+
+    for tag_dict in tag_queries:
+        if not tag_dict:
+            continue
+        tag_filter = _tag_dict_to_filter(tag_dict)
+        query_parts.append(f'node(poly:"{polygon_coords}"){tag_filter};')
+        query_parts.append(f'way(poly:"{polygon_coords}"){tag_filter};')
+        query_parts.append(f'relation(poly:"{polygon_coords}"){tag_filter};')
+
+    query_parts.append(");")
+    query_parts.append("out center tags qt;")
+    overpass_query = "\n".join(query_parts)
+
+    cache_key_src = f"{config.overpass_url}\nPOST\n{overpass_query}"
+    json_root = cache_load("tag_points", cache_key_src)
+
+    if json_root is None:
+        logger.debug("Downloading OSM point features by explicit tag queries ...")
+        resp = _overpass_request(
+            method="POST",
+            overpass_url=config.overpass_url,
+            data={"data": overpass_query},
+        )
+        json_root = resp.json()
+        cache_save_async("tag_points", cache_key_src, json_root)
+    else:
+        logger.debug("Using cached explicit tag point features.")
+
+    json_result = json_root.get("elements", [])
+    return pd.DataFrame(json_result)
+
+
 def fetch_member_tags(members_missing):
     """
     members_missing: iterable of dicts {'type': 'node|way|relation', 'ref': int}
