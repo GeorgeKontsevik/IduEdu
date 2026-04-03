@@ -175,11 +175,18 @@ def _inject_extra_tagged_platforms(
     total_skipped_near = 0
     total_skipped_attach = 0
 
-    platform_nodes = [
-        (node_id, data)
-        for node_id, data in graph_out.nodes(data=True)
-        if data.get("type") in {"platform", "subway_platform", "subway_entry_exit", "subway_entry", "subway_exit"}
-    ]
+    platform_nodes = []
+    for node_id, data in graph_out.nodes(data=True):
+        if data.get("type") not in {"platform", "subway_platform", "subway_entry_exit", "subway_entry", "subway_exit"}:
+            continue
+        try:
+            x = float(data["x"])
+            y = float(data["y"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        platform_nodes.append((node_id, data))
     platform_coords = np.array([(float(data["x"]), float(data["y"])) for _, data in platform_nodes], dtype=float)
     platform_tree = cKDTree(platform_coords) if len(platform_coords) else None
 
@@ -203,7 +210,16 @@ def _inject_extra_tagged_platforms(
                 lat = center.get("lat")
             if lon is None or lat is None:
                 continue
-            x, y = transformer.transform(float(lon), float(lat))
+            try:
+                lon = float(lon)
+                lat = float(lat)
+            except (TypeError, ValueError):
+                continue
+            if not (np.isfinite(lon) and np.isfinite(lat)):
+                continue
+            x, y = transformer.transform(lon, lat)
+            if not (np.isfinite(x) and np.isfinite(y)):
+                continue
             candidate_records.append(
                 {
                     "osm_ref": f"{row.get('type', 'element')}:{row.get('id')}",
@@ -218,11 +234,18 @@ def _inject_extra_tagged_platforms(
 
         total_candidates += len(candidate_records)
 
-        stop_nodes = [
-            (node_id, data)
-            for node_id, data in graph_out.nodes(data=True)
-            if data.get("type") == transport_type
-        ]
+        stop_nodes = []
+        for node_id, data in graph_out.nodes(data=True):
+            if data.get("type") != transport_type:
+                continue
+            try:
+                x = float(data["x"])
+                y = float(data["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not (np.isfinite(x) and np.isfinite(y)):
+                continue
+            stop_nodes.append((node_id, data))
         if not stop_nodes:
             total_skipped_attach += len(candidate_records)
             continue
@@ -232,6 +255,9 @@ def _inject_extra_tagged_platforms(
 
         for candidate in candidate_records:
             point_xy = np.array([candidate["x"], candidate["y"]], dtype=float)
+            if not np.isfinite(point_xy).all():
+                total_skipped_attach += 1
+                continue
 
             if platform_tree is not None:
                 dist_platform, _ = platform_tree.query(point_xy, k=1)
