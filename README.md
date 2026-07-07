@@ -1,19 +1,21 @@
 # iduedu-fork
 
-Forked IduEdu intermodal graph and OD-matrix backend.
+Forked IduEdu backend used for intermodal graph construction, stop handling, and OD/accessibility support in the dissertation pipeline.
 
-## Scheme
+## System Map
 
 ```mermaid
 flowchart LR
-    A[Inputs] --> B[Run: docs/examples/get_any_graph.ipynb]
-    B --> C[Checked outputs]
-    C --> D[Paper / thesis use]
+    CITY[city boundary] --> GRAPH[IduEdu graph]
+    STOPS[PT stops] --> GRAPH
+    GRAPH --> OD[OD matrix / routes]
+    OD --> BRIDGE[parent PT bridge]
+    BRIDGE --> PIPE[accessibility pipeline]
 ```
 
 ## Main Result
 
-![Main result](docs/_static/iduedulogo.svg)
+![IduEdu logo](docs/_static/iduedulogo.svg)
 
 ## Run
 
@@ -25,9 +27,7 @@ Human:
 pip install -e . && jupyter notebook docs/examples/get_any_graph.ipynb
 ```
 
-Agent:
-
-Use cache deliberately and preserve stop/mapping artifacts for PT bridges.
+Agent: use cache deliberately and preserve stop/mapping artifacts when bridging PT layers.
 
 ## Publication
 
@@ -35,4 +35,4 @@ Upstream docs: https://iduclub.github.io/IduEdu/
 
 ## Next Steps / Heuristics
 
-Heuristic: local UTM and explicit graph modes beat ad hoc projection/network helpers.
+Heuristic: explicit graph modes and local UTM handling are preferable to ad hoc network/projection helpers in the parent repo.
