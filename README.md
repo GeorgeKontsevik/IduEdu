@@ -1,5 +1,7 @@
 # iduedu-fork
 
+[![OSA-improved](https://img.shields.io/badge/improved%20by-OSA-yellow)](https://github.com/aimclub/OSA)
+
 Forked IduEdu backend used for intermodal graph construction, stop handling, and OD/accessibility support in the dissertation pipeline.
 
 ## System Map
@@ -36,3 +38,4 @@ Upstream docs: https://iduclub.github.io/IduEdu/
 ## Next Steps / Heuristics
 
 Heuristic: explicit graph modes and local UTM handling are preferable to ad hoc network/projection helpers in the parent repo.
+
